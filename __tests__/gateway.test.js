@@ -1,5 +1,5 @@
 import { jest } from '@jest/globals';
-import { ConnectionManager, TTSManager, buildSystemPrompt } from '../gateway.js';
+import { ConnectionManager, TTSManager, WhisperASR, buildSystemPrompt } from '../gateway.js';
 
 describe('ConnectionManager', () => {
   let manager;
@@ -64,6 +64,34 @@ describe('TTSManager', () => {
   test('handles empty text', () => {
     const chunks = TTSManager.chunkText('');
     expect(chunks).toEqual(['']);
+  });
+});
+
+describe('WhisperASR', () => {
+  test('downsamples 48kHz to 16kHz', () => {
+    // Create a simple 48kHz s16le buffer (6 samples = 12 bytes)
+    const input = Buffer.alloc(12);
+    input.writeInt16LE(100, 0);   // sample 0
+    input.writeInt16LE(200, 2);   // sample 1
+    input.writeInt16LE(300, 4);   // sample 2
+    input.writeInt16LE(400, 6);   // sample 3
+    input.writeInt16LE(500, 8);   // sample 4
+    input.writeInt16LE(600, 10);  // sample 5
+
+    const output = WhisperASR.downsample(input, 48000, 16000);
+
+    // 48000/16000 = 3, so 6 samples -> 2 samples (4 bytes)
+    expect(output.length).toBe(4);
+    expect(output.readInt16LE(0)).toBe(100);  // sample 0
+    expect(output.readInt16LE(2)).toBe(400);  // sample 3
+  });
+
+  test('returns same buffer when rates match', () => {
+    const input = Buffer.alloc(8);
+    input.writeInt16LE(1000, 0);
+    input.writeInt16LE(2000, 2);
+    const output = WhisperASR.downsample(input, 16000, 16000);
+    expect(output).toBe(input);
   });
 });
 

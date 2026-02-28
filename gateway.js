@@ -4,6 +4,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import { v4 as uuidv4 } from 'uuid';
 import { spawn } from 'child_process';
+import WebSocket from 'ws';
 import { searchProducts, getProductDetails, checkAvailability, getStoreInfo, compareProducts, addToCart } from './tools/index.js';
 
 const require = createRequire(import.meta.url);
@@ -13,7 +14,7 @@ try { const { config } = await import('dotenv'); config(); } catch { /* dotenv n
 
 const {
   PORT = 5050,
-  OPENAI_API_KEY,
+  WHISPER_URL = 'ws://localhost:8000/v1/asr/stream',
   ANTHROPIC_API_KEY,
   ELEVEN_API_KEY,
   ELEVEN_VOICE_ID,
@@ -267,104 +268,149 @@ class TTSManager {
   }
 }
 
-// ─── ASR (Whisper) ──────────────────────────────────────────────────────────
+// ─── ASR (Self-Hosted Whisper via WebSocket) ────────────────────────────────
 
 class WhisperASR {
-  constructor(apiKey) {
-    this.apiKey = apiKey;
-    this.buffer = Buffer.alloc(0);
-    this.silenceThreshold = 500; // ms of silence before sending
-    this.lastSpeechAt = 0;
-    this.timer = null;
+  /**
+   * @param {string} whisperUrl - WebSocket URL for the self-hosted faster-whisper service
+   */
+  constructor(whisperUrl) {
+    this.whisperUrl = whisperUrl;
+    this.ws = null;
+    this.connected = false;
+    this.reconnectTimer = null;
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 5;
+    this.destroyed = false;
+
+    /** @type {((text: string) => void)|null} */
     this.onTranscript = null;
+    /** @type {(() => void)|null} */
+    this.onSpeechStart = null;
+    /** @type {(() => void)|null} */
+    this.onSpeechEnd = null;
+  }
+
+  /**
+   * Connect to the self-hosted Whisper ASR service via WebSocket.
+   */
+  connect() {
+    if (this.destroyed) return;
+
+    try {
+      const sessionId = `gw-${uuidv4().slice(0, 8)}`;
+      const url = `${this.whisperUrl}?session_id=${sessionId}`;
+
+      this.ws = new WebSocket(url);
+      this.ws.binaryType = 'nodebuffer';
+
+      this.ws.on('open', () => {
+        this.connected = true;
+        this.reconnectAttempts = 0;
+        console.log(`[asr] Connected to Whisper service at ${this.whisperUrl}`);
+      });
+
+      this.ws.on('message', (data) => {
+        try {
+          const msg = JSON.parse(data.toString());
+
+          if (msg.event === 'connected') {
+            console.log(`[asr] Session established: ${msg.session_id}`);
+          } else if (msg.event === 'speech_start') {
+            this.onSpeechStart?.();
+          } else if (msg.event === 'speech_end') {
+            this.onSpeechEnd?.();
+          } else if (msg.text && msg.final) {
+            console.log(`[asr] Transcript: "${msg.text}"`);
+            this.onTranscript?.(msg.text);
+          } else if (msg.error) {
+            console.error(`[asr] Service error: ${msg.error}`);
+          }
+        } catch {
+          // Non-JSON message, ignore
+        }
+      });
+
+      this.ws.on('close', () => {
+        this.connected = false;
+        if (!this.destroyed) {
+          this.scheduleReconnect();
+        }
+      });
+
+      this.ws.on('error', (err) => {
+        console.error(`[asr] WebSocket error: ${err.message}`);
+        this.connected = false;
+      });
+    } catch (err) {
+      console.error(`[asr] Failed to connect: ${err.message}`);
+      this.scheduleReconnect();
+    }
+  }
+
+  scheduleReconnect() {
+    if (this.destroyed || this.reconnectAttempts >= this.maxReconnectAttempts) {
+      if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+        console.error('[asr] Max reconnect attempts reached');
+      }
+      return;
+    }
+
+    this.reconnectAttempts++;
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts - 1), 10_000);
+    console.log(`[asr] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
+
+    this.reconnectTimer = setTimeout(() => this.connect(), delay);
   }
 
   /**
    * Feed raw PCM audio data (s16le, 48kHz, mono).
+   * Downsamples to 16kHz before sending to the ASR service.
    */
   feed(pcmData) {
-    this.buffer = Buffer.concat([this.buffer, pcmData]);
-    this.lastSpeechAt = Date.now();
+    if (!this.connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
-    // Check for speech activity (simple energy-based VAD)
-    if (this.hasEnergy(pcmData)) {
-      clearTimeout(this.timer);
-      this.timer = setTimeout(() => this.flush(), this.silenceThreshold);
-    }
-  }
-
-  hasEnergy(pcmData) {
-    let energy = 0;
-    for (let i = 0; i < pcmData.length - 1; i += 2) {
-      const sample = pcmData.readInt16LE(i);
-      energy += Math.abs(sample);
-    }
-    return (energy / (pcmData.length / 2)) > 200;
-  }
-
-  async flush() {
-    if (this.buffer.length < 4800) return; // Less than 50ms of audio
-
-    const audioBuffer = this.buffer;
-    this.buffer = Buffer.alloc(0);
+    // Downsample from 48kHz to 16kHz (take every 3rd sample)
+    const downsampled = WhisperASR.downsample(pcmData, 48000, 16000);
 
     try {
-      // Convert PCM to WAV for Whisper API
-      const wavBuffer = this.pcmToWav(audioBuffer, 48000, 1, 16);
-
-      const form = new FormData();
-      form.append('file', new Blob([wavBuffer], { type: 'audio/wav' }), 'audio.wav');
-      form.append('model', 'whisper-1');
-      form.append('language', 'en');
-
-      const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${this.apiKey}` },
-        body: form,
-      });
-
-      if (!res.ok) {
-        console.error(`[asr] Whisper error: ${res.status}`);
-        return;
-      }
-
-      const data = await res.json();
-      if (data.text?.trim()) {
-        this.onTranscript?.(data.text.trim());
-      }
+      this.ws.send(downsampled);
     } catch (err) {
-      console.error('[asr] Transcription error:', err.message);
+      console.error(`[asr] Send error: ${err.message}`);
     }
   }
 
   /**
-   * Convert raw PCM to WAV format.
+   * Downsample s16le PCM from one sample rate to another.
+   * Uses simple decimation (every Nth sample).
    */
-  pcmToWav(pcmData, sampleRate, channels, bitsPerSample) {
-    const byteRate = sampleRate * channels * (bitsPerSample / 8);
-    const blockAlign = channels * (bitsPerSample / 8);
-    const header = Buffer.alloc(44);
+  static downsample(pcmBuffer, fromRate, toRate) {
+    if (fromRate === toRate) return pcmBuffer;
 
-    header.write('RIFF', 0);
-    header.writeUInt32LE(36 + pcmData.length, 4);
-    header.write('WAVE', 8);
-    header.write('fmt ', 12);
-    header.writeUInt32LE(16, 16);
-    header.writeUInt16LE(1, 20); // PCM
-    header.writeUInt16LE(channels, 22);
-    header.writeUInt32LE(sampleRate, 24);
-    header.writeUInt32LE(byteRate, 28);
-    header.writeUInt16LE(blockAlign, 32);
-    header.writeUInt16LE(bitsPerSample, 34);
-    header.write('data', 36);
-    header.writeUInt32LE(pcmData.length, 40);
+    const ratio = fromRate / toRate;
+    const srcSamples = pcmBuffer.length / 2;
+    const dstSamples = Math.floor(srcSamples / ratio);
+    const output = Buffer.alloc(dstSamples * 2);
 
-    return Buffer.concat([header, pcmData]);
+    for (let i = 0; i < dstSamples; i++) {
+      const srcIndex = Math.floor(i * ratio);
+      const value = pcmBuffer.readInt16LE(srcIndex * 2);
+      output.writeInt16LE(value, i * 2);
+    }
+
+    return output;
   }
 
   destroy() {
-    clearTimeout(this.timer);
-    this.buffer = Buffer.alloc(0);
+    this.destroyed = true;
+    clearTimeout(this.reconnectTimer);
+
+    if (this.ws) {
+      try { this.ws.close(); } catch {}
+      this.ws = null;
+    }
+
+    this.connected = false;
   }
 }
 
@@ -499,8 +545,22 @@ async function handleAudioPipeline(peerId, storeConfig, connectionManager) {
     });
   };
 
-  // Set up ASR
-  const asr = new WhisperASR(OPENAI_API_KEY);
+  // Set up ASR (self-hosted faster-whisper via WebSocket)
+  const asr = new WhisperASR(WHISPER_URL);
+
+  asr.onSpeechStart = () => {
+    // Interrupt TTS when user starts speaking (barge-in)
+    tts.interrupt();
+    if (dataChannel?.readyState === 'open') {
+      dataChannel.send(JSON.stringify({ type: 'speech_start' }));
+    }
+  };
+
+  asr.onSpeechEnd = () => {
+    if (dataChannel?.readyState === 'open') {
+      dataChannel.send(JSON.stringify({ type: 'speech_end' }));
+    }
+  };
 
   asr.onTranscript = async (text) => {
     connectionManager.touch(peerId);
@@ -510,9 +570,6 @@ async function handleAudioPipeline(peerId, storeConfig, connectionManager) {
     if (dataChannel?.readyState === 'open') {
       dataChannel.send(JSON.stringify({ type: 'transcript', text }));
     }
-
-    // Interrupt TTS if speaking
-    tts.interrupt();
 
     // Add to conversation history
     conversationHistory.push({ role: 'user', content: text });
@@ -527,6 +584,9 @@ async function handleAudioPipeline(peerId, storeConfig, connectionManager) {
       }
     }
   };
+
+  // Connect to Whisper service
+  asr.connect();
 
   // Connect audio sink to ASR
   audioSink.ondata = (data) => {

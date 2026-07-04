@@ -509,12 +509,9 @@ async function handleAudioPipeline(peerId, storeConfig, connectionManager) {
     // Interrupt TTS if speaking
     tts.interrupt();
 
-    // Add to conversation history
-    conversationHistory.push({ role: 'user', content: text });
-
-    // Generate response
+    // Generate response — the Shopmata brain, not a local LLM loop
     try {
-      await generateAndSpeak(peerId, storeConfig, conversationHistory, tts, dataChannel, connectionManager);
+      await generateAndSpeak(peerId, text, tts, dataChannel, connectionManager);
     } catch (err) {
       console.error(`[llm] Error for peer ${peerId}:`, err.message);
       if (dataChannel?.readyState === 'open') {
@@ -543,84 +540,70 @@ async function handleAudioPipeline(peerId, storeConfig, connectionManager) {
   tts.speak(welcomeMessage);
 }
 
-async function generateAndSpeak(peerId, storeConfig, conversationHistory, tts, dataChannel, connectionManager) {
-  const systemPrompt = buildSystemPrompt(storeConfig);
-  let fullResponse = '';
-  let toolUse = null;
-  let toolInput = '';
+/**
+ * One salesman turn via the Shopmata brain — the same StorefrontChatService
+ * that powers the widget (tools, person memory, mode switching, guardrails).
+ * The gateway is ears and mouth only: ASR in, this call, TTS out.
+ */
+async function generateAndSpeak(peerId, transcript, tts, dataChannel, connectionManager) {
+  const peer = connectionManager.get(peerId);
+  if (!peer) return;
 
-  for await (const event of streamClaude(systemPrompt, conversationHistory, CLAUDE_TOOLS)) {
-    if (event.type === 'content_block_start') {
-      if (event.content_block?.type === 'tool_use') {
-        toolUse = { id: event.content_block.id, name: event.content_block.name };
-        toolInput = '';
-      }
-    } else if (event.type === 'content_block_delta') {
-      if (event.delta?.type === 'text_delta') {
-        fullResponse += event.delta.text;
-      } else if (event.delta?.type === 'input_json_delta') {
-        toolInput += event.delta.partial_json;
-      }
-    } else if (event.type === 'content_block_stop' && toolUse) {
-      // Execute tool
-      const toolFn = TOOL_NAME_MAP[toolUse.name];
-      if (toolFn && TOOLS[toolFn]) {
-        if (dataChannel?.readyState === 'open') {
-          dataChannel.send(JSON.stringify({ type: 'tool_use', name: toolUse.name, status: 'executing' }));
-        }
-
-        let params;
-        try { params = JSON.parse(toolInput || '{}'); } catch { params = {}; }
-
-        const result = await TOOLS[toolFn](params, storeConfig);
-
-        // Handle add_to_cart specially — send to widget
-        if (toolUse.name === 'add_to_cart' && result.success && dataChannel?.readyState === 'open') {
-          dataChannel.send(JSON.stringify({
-            type: 'add_to_cart',
-            variant_id: result.shopify_variant_id,
-            product_title: result.product_title,
-            quantity: params.quantity || 1,
-          }));
-        }
-
-        // Continue conversation with tool result
-        conversationHistory.push({
-          role: 'assistant',
-          content: [
-            { type: 'text', text: fullResponse },
-            { type: 'tool_use', id: toolUse.id, name: toolUse.name, input: params },
-          ],
-        });
-        conversationHistory.push({
-          role: 'user',
-          content: [{ type: 'tool_result', tool_use_id: toolUse.id, content: JSON.stringify(result) }],
-        });
-
-        // Get follow-up response after tool result
-        fullResponse = '';
-        toolUse = null;
-
-        for await (const followUp of streamClaude(systemPrompt, conversationHistory, CLAUDE_TOOLS)) {
-          if (followUp.type === 'content_block_delta' && followUp.delta?.type === 'text_delta') {
-            fullResponse += followUp.delta.text;
-          }
-        }
-      }
-
-      toolUse = null;
-    }
+  if (dataChannel?.readyState === 'open') {
+    dataChannel.send(JSON.stringify({ type: 'tool_use', name: 'thinking', status: 'Thinking...' }));
   }
 
-  if (fullResponse) {
-    conversationHistory.push({ role: 'assistant', content: fullResponse });
+  const res = await fetch(`${SHOPMATA_API_URL}/api/storefront/voice-message`, {
+    method: 'POST',
+    headers: {
+      'X-Internal-Key': SHOPMATA_INTERNAL_KEY,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      shop: peer.shop,
+      visitor_id: peer.visitorId,
+      session_id: peer.chatSessionId || peer.sessionId || null,
+      message: transcript,
+    }),
+  });
 
-    if (dataChannel?.readyState === 'open') {
-      dataChannel.send(JSON.stringify({ type: 'response', text: fullResponse }));
-    }
-
-    await tts.speak(fullResponse);
+  if (!res.ok) {
+    throw new Error(`voice-message failed: ${res.status}`);
   }
+
+  const data = await res.json();
+  peer.chatSessionId = data.session_id;
+
+  if (data.cart_action?.variant_id && dataChannel?.readyState === 'open') {
+    dataChannel.send(JSON.stringify({
+      type: 'add_to_cart',
+      variant_id: data.cart_action.variant_id,
+      product_title: data.cart_action.product_title,
+      quantity: data.cart_action.quantity || 1,
+    }));
+  }
+
+  const spoken = toSpeakable(data.reply || '');
+  if (!spoken) return;
+
+  if (dataChannel?.readyState === 'open') {
+    dataChannel.send(JSON.stringify({ type: 'response', text: data.reply, products: data.products || [] }));
+  }
+
+  await tts.speak(spoken);
+}
+
+/**
+ * The brain writes for chat (markdown, tables); the mouth needs plain
+ * speech. Strip formatting without touching the words.
+ */
+function toSpeakable(text) {
+  return text
+    .replace(/\|[^\n]*\|/g, ' ')            // table rows
+    .replace(/[*_#`>]+/g, '')                // markdown marks
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1') // links -> label
+    .replace(/\s{2,}/g, ' ')
+    .trim();
 }
 
 // ─── Express Server ─────────────────────────────────────────────────────────
@@ -707,8 +690,10 @@ app.post('/offer', async (req, res) => {
       audioSink: null,
       dataChannel,
       storeConfig,
-      visitorId: visitor_id,
+      shop,
+      visitorId: visitor_id || uuidv4(),
       sessionId: session_id,
+      chatSessionId: session_id || null,
     });
 
     // Handle data channel for barge-in / VAD

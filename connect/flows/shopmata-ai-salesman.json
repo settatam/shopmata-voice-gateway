@@ -1,0 +1,115 @@
+{
+    "Version": "2019-10-30",
+    "StartAction": "lex",
+    "Actions": [
+        {
+            "Identifier": "lex",
+            "Type": "ConnectParticipantWithLexBot",
+            "Parameters": {
+                "Text": "Thanks for calling Aurelia Fine Jewelers! This is Aurelia. I can help you find a piece, value something you want to sell, check an order, or book a visit. How can I help?",
+                "LexV2Bot": {
+                    "AliasArn": "arn:aws:lex:us-east-1:277503816012:bot-alias/LU05C8ELLT/TSTALIASID"
+                },
+                "LexSessionAttributes": {
+                    "caller_number": "$.CustomerEndpoint.Address",
+                    "dialed_number": "$.SystemEndpoint.Address"
+                }
+            },
+            "Transitions": {
+                "NextAction": "check-transfer",
+                "Errors": [
+                    {
+                        "NextAction": "goodbye",
+                        "ErrorType": "NoMatchingError"
+                    },
+                    {
+                        "NextAction": "goodbye",
+                        "ErrorType": "NoMatchingCondition"
+                    }
+                ]
+            }
+        },
+        {
+            "Identifier": "goodbye",
+            "Type": "MessageParticipant",
+            "Parameters": {
+                "Text": "Thanks for calling. We look forward to seeing you. Goodbye!"
+            },
+            "Transitions": {
+                "NextAction": "disconnect",
+                "Errors": [
+                    {
+                        "NextAction": "disconnect",
+                        "ErrorType": "NoMatchingError"
+                    }
+                ]
+            }
+        },
+        {
+            "Identifier": "disconnect",
+            "Type": "DisconnectParticipant",
+            "Parameters": {}
+        },
+        {
+            "Identifier": "check-transfer",
+            "Type": "Compare",
+            "Parameters": {
+                "ComparisonValue": "$.Lex.SessionAttributes.transfer_to"
+            },
+            "Transitions": {
+                "NextAction": "goodbye",
+                "Conditions": [
+                    {
+                        "NextAction": "transfer-human",
+                        "Condition": {
+                            "Operator": "TextStartsWith",
+                            "Operands": [
+                                "+"
+                            ]
+                        }
+                    }
+                ],
+                "Errors": [
+                    {
+                        "NextAction": "goodbye",
+                        "ErrorType": "NoMatchingCondition"
+                    }
+                ]
+            }
+        },
+        {
+            "Identifier": "transfer-human",
+            "Type": "TransferParticipantToThirdParty",
+            "Parameters": {
+                "ThirdPartyPhoneNumber": "$.Lex.SessionAttributes.transfer_to",
+                "ThirdPartyConnectionTimeLimitSeconds": "30",
+                "ContinueFlowExecution": "False"
+            },
+            "Transitions": {
+                "NextAction": "transfer-failed",
+                "Errors": [
+                    {
+                        "NextAction": "transfer-failed",
+                        "ErrorType": "NoMatchingError"
+                    }
+                ]
+            }
+        },
+        {
+            "Identifier": "transfer-failed",
+            "Type": "MessageParticipant",
+            "Parameters": {
+                "Text": "I wasn't able to reach anyone right now. Please leave your name and number with us by calling back, or visit us during business hours. Thank you!"
+            },
+            "Transitions": {
+                "NextAction": "disconnect",
+                "Errors": [
+                    {
+                        "NextAction": "disconnect",
+                        "ErrorType": "NoMatchingError"
+                    }
+                ]
+            }
+        }
+    ]
+}

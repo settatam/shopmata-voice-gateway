@@ -1,0 +1,55 @@
+{
+    "Version": "2019-10-30",
+    "StartAction": "lex",
+    "Actions": [
+        {
+            "Identifier": "lex",
+            "Type": "ConnectParticipantWithLexBot",
+            "Parameters": {
+                "Text": "Hi! This is the Shopmata AI concierge \u2014 you asked for a test call from our try-it-out page. I've just read your website, so ask me anything a customer might: your policies, your story, what you sell. What would you like to try?",
+                "LexV2Bot": {
+                    "AliasArn": "arn:aws:lex:us-east-1:277503816012:bot-alias/LU05C8ELLT/TSTALIASID"
+                },
+                "LexSessionAttributes": {
+                    "caller_number": "$.CustomerEndpoint.Address",
+                    "shop_domain": "demo-tryout.shopmata.com",
+                    "demo_token": "$.Attributes.demo_token"
+                }
+            },
+            "Transitions": {
+                "NextAction": "goodbye",
+                "Errors": [
+                    {
+                        "NextAction": "goodbye",
+                        "ErrorType": "NoMatchingError"
+                    },
+                    {
+                        "NextAction": "goodbye",
+                        "ErrorType": "NoMatchingCondition"
+                    }
+                ]
+            }
+        },
+        {
+            "Identifier": "goodbye",
+            "Type": "MessageParticipant",
+            "Parameters": {
+                "Text": "Thanks for test-driving Shopmata! Install the app from the Shopify App Store and this is what your customers get, around the clock. Goodbye!"
+            },
+            "Transitions": {
+                "NextAction": "disconnect",
+                "Errors": [
+                    {
+                        "NextAction": "disconnect",
+                        "ErrorType": "NoMatchingError"
+                    }
+                ]
+            }
+        },
+        {
+            "Identifier": "disconnect",
+            "Type": "DisconnectParticipant",
+            "Parameters": {}
+        }
+    ]
+}

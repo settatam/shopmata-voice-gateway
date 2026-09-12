@@ -5,7 +5,6 @@ import helmet from 'helmet';
 import { v4 as uuidv4 } from 'uuid';
 import { spawn } from 'child_process';
 import { searchProducts, getProductDetails, checkAvailability, getStoreInfo, compareProducts, addToCart } from './tools/index.js';
-import { attachRelay } from './relay.js';
 
 const require = createRequire(import.meta.url);
 
@@ -750,13 +749,6 @@ app.post('/disconnect', (req, res) => {
 
 const server = app.listen(PORT, () => {
   console.log(`[gateway] Shopmata Voice Gateway running on port ${PORT}`);
-});
-
-// Twilio ConversationRelay ingress (phone concierge). Laravel signs the wss
-// URL; unsigned connects are rejected before the WebSocket is served.
-attachRelay(server, {
-  apiUrl: SHOPMATA_API_URL,
-  internalKey: SHOPMATA_INTERNAL_KEY,
 });
 
 // Graceful shutdown
